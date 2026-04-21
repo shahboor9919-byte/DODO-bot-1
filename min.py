@@ -28,6 +28,41 @@ except ImportError:
     BERLIN_TZ = timezone(timedelta(hours=2))
     UTC = timezone.utc
 
+# =================== CONFIG SYSTEM ===================
+import os
+
+class Config:
+    def __init__(self):
+        self.BINGX_API_KEY     = os.getenv("BINGX_API_KEY")
+        self.BINGX_API_SECRET  = os.getenv("BINGX_API_SECRET")
+        self.TG_TOKEN          = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.TG_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID")
+        self.PORT              = int(os.getenv("PORT", 5000))
+        self.SELF_URL          = os.getenv("RENDER_EXTERNAL_URL", "")
+
+CONFIG = Config()
+
+# =================== VALIDATION ===================
+def validate_config(cfg):
+    errors = []
+
+    if not cfg.BINGX_API_KEY:
+        errors.append("Missing BINGX_API_KEY")
+    if not cfg.BINGX_API_SECRET:
+        errors.append("Missing BINGX_API_SECRET")
+    if not cfg.TG_TOKEN:
+        errors.append("Missing TELEGRAM_BOT_TOKEN")
+    if not cfg.TG_CHAT_ID:
+        errors.append("Missing TELEGRAM_CHAT_ID")
+
+    if errors:
+        print("CONFIG ERRORS:")
+        for e in errors:
+            print(" -", e)
+        raise SystemExit("❌ CONFIG INVALID")
+
+validate_config(CONFIG)
+
 def now_utc():
     return datetime.now(UTC)
 
@@ -685,12 +720,12 @@ bot_state = {
 }
 
 # =================== ENV / MODE ===================
-API_KEY = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
+API_KEY = CONFIG.BINGX_API_KEY
+API_SECRET = CONFIG.BINGX_API_SECRET
 MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 
-SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
-PORT = int(os.getenv("PORT", 5000))
+SELF_URL = CONFIG.SELF_URL
+PORT = CONFIG.PORT
 
 LOG_LEGACY = False
 LOG_ADDONS = True
@@ -4644,8 +4679,8 @@ def get_trade_target(df, side):
 # =================== TELEGRAM SYSTEM ===================
 import requests
 
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+TG_TOKEN = CONFIG.TG_TOKEN
+TG_CHAT  = CONFIG.TG_CHAT_ID
 
 def tg_send(msg):
     if not TG_TOKEN or not TG_CHAT:
@@ -6210,6 +6245,7 @@ def build_thinking():
 
 # =================== FLASK DASHBOARD ===================
 app = Flask(__name__)
+START_TIME = time.time()
 
 @app.route("/")
 def dashboard():
@@ -6764,23 +6800,36 @@ def metrics():
 
 @app.route("/health")
 def health():
+    return jsonify({
+        "status": "ok",
+        "uptime": int(time.time() - START_TIME)
+    })
+
+def keep_alive():
+    while True:
+        try:
+            if CONFIG.SELF_URL:
+                import requests
+                requests.get(CONFIG.SELF_URL + "/health")
+        except:
+            pass
+        time.sleep(300)  # كل 5 دقائق
+
+def tg_send_start():
     try:
-        state_serial = make_serializable(STATE)
-        response = {
-            "ok": True, "mode": "live" if MODE_LIVE else "paper",
-            "open": has_open_position(), "side": state_serial["side"], "qty": state_serial["qty"],
-            "compound_pnl": compound_pnl, "timestamp": format_time(),
-            "entry_mode": "IMMEDIATE_SCAN", "wait_for_next_signal": wait_for_next_signal_side,
-            "source": state_serial.get("source", "Unknown"),
-            "cooldown": state_serial["cooldown_until"] is not None,
-            "daily_trades": state_serial.get("daily_trades", 0),
-            "consecutive_losses": state_serial.get("consecutive_losses", 0),
-            "daily_loss_limit_hit": state_serial.get("daily_loss_limit_hit", False)
-        }
-        return jsonify(make_serializable(response)), 200
-    except Exception as e:
-        log_error(f"/health error: {e}")
-        return {"error": str(e)}, 500
+        import requests
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={
+                "chat_id": TG_CHAT,
+                "text": "🚀 BOT STARTED SUCCESSFULLY"
+            },
+            timeout=5
+        )
+    except:
+        pass
+
+tg_send_start()
 
 @app.route("/reset_paper", methods=["POST"])
 def reset_paper():
@@ -6795,19 +6844,6 @@ def reset_paper():
     }
     trade_history = []
     return jsonify({"status": "paper_reset", "balance": paper["balance"]})
-
-def keepalive_loop():
-    url=(SELF_URL or "").strip().rstrip("/")
-    if not url:
-        log_warn("keepalive disabled (SELF_URL not set)")
-        return
-    import requests
-    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-live-bot/keepalive"})
-    log_i(f"KEEPALIVE every 50s → {url}")
-    while True:
-        try: sess.get(url, timeout=8)
-        except Exception: pass
-        time.sleep(50)
 
 def initialize_bot():
     global SYMBOLS, STATE, compound_pnl, wait_for_next_signal_side, bot_state, TOP_SYMBOLS, SCAN_LIST
@@ -6934,7 +6970,7 @@ def initialize_bot():
 
 if __name__ == "__main__":
     import threading
-    port = int(os.environ.get("PORT", 8000))
+    port = CONFIG.PORT
     signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda sig, frame: sys.exit(0))
     log(f"Starting web server on port {port}")
@@ -6953,6 +6989,5 @@ if __name__ == "__main__":
             tg_error(e)
     bot_thread = threading.Thread(target=start_bot_async, daemon=True)
     bot_thread.start()
+    threading.Thread(target=keep_alive, daemon=True).start()
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-    if SELF_URL:
-        threading.Thread(target=keepalive_loop, daemon=True).start()

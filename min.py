@@ -4,7 +4,7 @@ RF Futures Bot — PROFESSIONAL SNIPER EDITION v17.3 (Institutional Hunter)
 + Sniper Engine + Monitoring + Auto-Recovery (FULLY INTEGRATED)
 FIX: _ema defined globally for radar scanner
 + Sniper Queue (Non‑Blocking Priority System)
-+ FIX: Signal-to-Execution mapping unified (map_signal) - prevents inverted trades and 101205 errors
++ REFACTOR: Unified Execution Layer (Single Source of Truth for Direction)
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json, datetime as dt, gc
@@ -160,7 +160,6 @@ def monitor_log_warning(msg):
     MONITOR_WARNINGS.append(entry)
     if len(MONITOR_WARNINGS) > MAX_MONITOR_LOGS:
         MONITOR_WARNINGS.pop(0)
-    # Telegram only for errors, not warnings
 
 def get_monitoring_data():
     return {
@@ -526,7 +525,7 @@ def paper_close(price, qty=None):
     log(f"🔴 PAPER CLOSE | PnL={pnl:.2f} | Balance={paper['balance']:.2f}")
     paper["position"] = None
 
-# =================== REAL POSITION HANDLER (FIXED) ===================
+# =================== REAL POSITION HANDLER ===================
 MIN_NOTIONAL = 5.0
 
 def is_dust(notional):
@@ -540,7 +539,6 @@ def normalize_side(side_raw):
         return "SHORT"
     return "UNKNOWN"
 
-# ✅ NEW: Reliable position sync (FIXED)
 def get_real_position(symbol):
     """Fetch actual exchange position safely. Returns None or dict with side/amount."""
     try:
@@ -559,7 +557,6 @@ def get_real_position(symbol):
         log_error(f"❌ get_real_position error: {e}")
         return None
 
-# Keep old function for compatibility but delegate to new one
 def get_real_position_safe(exchange, symbol):
     return get_real_position(symbol)
 
@@ -574,6 +571,7 @@ def detect_position_mode():
     return "oneway"
 
 def safe_close(exchange, symbol):
+    """Close position with correct side and reduceOnly, using unified direction."""
     for attempt in range(3):
         try:
             pos = get_real_position(symbol)
@@ -587,16 +585,15 @@ def safe_close(exchange, symbol):
                 return True
 
             pos_side = pos["side"]   # "LONG" or "SHORT"
-            side = "sell" if pos_side == "LONG" else "buy"
+            close_side = "sell" if pos_side == "LONG" else "buy"
 
             amount = float(exchange.amount_to_precision(symbol, size))
-            # ✅ FIX: always include positionSide and reduceOnly
-            params = {"reduceOnly": True, "positionSide": pos_side}
+            params = build_order_params(pos_side, reduce_only=True)
 
             order = exchange.create_order(
                 symbol,
                 "market",
-                side,
+                close_side,
                 amount,
                 params=params
             )
@@ -614,9 +611,7 @@ def force_close(symbol):
     try:
         pos = get_real_position(symbol)
         if pos:
-            side = "sell" if pos["side"] == "LONG" else "buy"
-            amount = pos["amount"]
-            log(f"⚠️ FORCE CLOSE TRIGGERED for {symbol} {pos['side']} {amount}")
+            log(f"⚠️ FORCE CLOSE TRIGGERED for {symbol} {pos['side']} {pos['amount']}")
             return safe_close(ex, symbol)
     except Exception as e:
         log(f"❌ FORCE CLOSE FAILED: {e}")
@@ -1174,7 +1169,6 @@ def sync_account_state():
         if pos and pos.get("amount", 0) > 0:
             STATE["open"] = True
             STATE["side"] = pos["side"].lower()
-            # Fetch entry price from position raw data
             entry_price = float(pos["raw"].get("entryPrice", 0))
             STATE["entry"] = entry_price
             STATE["qty"] = pos["amount"]
@@ -1262,77 +1256,103 @@ def calculate_position_size_real(symbol, price, score):
 
     return raw_qty
 
-# =================== FIXED BINGX LEVERAGE ===================
-def set_leverage_safe(symbol, leverage, pos_side):
+# =================== UNIFIED EXECUTION LAYER (REFACTOR) ===================
+
+def resolve_direction(signal: str):
+    """
+    Single Source of Truth for direction mapping.
+    Returns (order_side, position_side) e.g., ("buy", "LONG") or ("sell", "SHORT").
+    """
+    s = signal.lower().strip()
+    if s in ("buy", "long"):
+        return "buy", "LONG"
+    elif s in ("sell", "short"):
+        return "sell", "SHORT"
+    else:
+        raise ValueError(f"Invalid signal: {signal}")
+
+def assert_direction_consistency(side: str, position_side: str):
+    """Raise error if side and positionSide mismatch."""
+    if side == "buy" and position_side != "LONG":
+        raise RuntimeError(f"Direction mismatch: side={side} vs positionSide={position_side}")
+    if side == "sell" and position_side != "SHORT":
+        raise RuntimeError(f"Direction mismatch: side={side} vs positionSide={position_side}")
+
+def build_order_params(position_side: str, reduce_only: bool = False):
+    """Construct params dict for BingX orders with correct positionSide."""
+    params = {"positionSide": position_side}
+    if reduce_only:
+        params["reduceOnly"] = True
+    return params
+
+# ------------------------------------------------------------
+# Leverage setter (uses positionSide, not side)
+def set_leverage_safe(exchange, symbol, leverage, position_side):
+    """Set leverage for a specific position side (LONG/SHORT)."""
     try:
-        # ✅ FIX: use pos_side (LONG/SHORT) explicitly, NOT infer from buy/sell
-        params = {"side": pos_side}
-        ex.set_leverage(leverage, symbol, params=params)
-        log_i(f"⚙️ leverage {leverage}x for {pos_side} on {symbol}")
+        params = {"side": position_side}  # BingX expects "LONG" or "SHORT"
+        exchange.set_leverage(leverage, symbol, params=params)
+        log_i(f"⚙️ leverage {leverage}x for {position_side} on {symbol}")
     except Exception as e:
         log_warn(f"leverage error: {e}")
 
-def set_margin_mode(exchange, symbol, mode="ISOLATED"):
-    try:
-        exchange.set_margin_mode(mode, symbol)
-        log_event("INFO", f"Margin mode set to {mode} for {symbol}")
-    except Exception as e:
-        log_event("WARN", f"Margin mode setting failed: {e}")
+# ------------------------------------------------------------
+# Unified open position (primary entry)
+def open_position(exchange, symbol, signal, qty):
+    """Open a position using unified direction mapping."""
+    side, pos_side = resolve_direction(signal)
+    assert_direction_consistency(side, pos_side)
 
-# =================== UNIFIED SIGNAL MAPPER (HOTFIX) ===================
-def map_signal(signal):
-    """Convert signal (LONG/SHORT) to (order_side, position_side)."""
-    s = str(signal).upper()
-    if s == "LONG":
-        return "buy", "LONG"
-    elif s == "SHORT":
-        return "sell", "SHORT"
+    params = build_order_params(pos_side, reduce_only=False)
+
+    order = exchange.create_order(
+        symbol=symbol,
+        type="market",
+        side=side,
+        amount=qty,
+        params=params
+    )
+    log_g(f"✅ OPEN {pos_side} | side={side} qty={qty:.6f} {symbol}")
+    return order
+
+# ------------------------------------------------------------
+# Unified close position (full or partial)
+def close_position(exchange, symbol, qty=None, reduce_only=True):
+    """
+    Close a position fully or partially using unified direction.
+    If qty is None, close entire position.
+    """
+    pos = get_real_position(symbol)
+    if not pos:
+        log_event("INFO", "No position to close")
+        return True
+
+    pos_side = pos["side"]                # LONG / SHORT
+    close_side = "sell" if pos_side == "LONG" else "buy"
+
+    if qty is None:
+        qty = float(pos["amount"])
     else:
-        log_error(f"Invalid signal passed to map_signal: {signal}")
-        return None, None
+        qty = min(qty, float(pos["amount"]))
 
-# =================== SMART EXECUTION (FIXED) ===================
-def execute_trade_smart(symbol, signal, qty):
-    """Execute market order using SIGNAL (LONG/SHORT)."""
-    try:
-        side, pos_side = map_signal(signal)
-        if not side:
-            log_error(f"Invalid signal: {signal}")
-            return None
+    if qty <= 0:
+        log_warn("Close qty <= 0, ignoring")
+        return True
 
-        # Use price from orderbook for better fill (optional, fallback to ticker)
-        ob = get_orderbook_safe(symbol, limit=5)
-        if not ob["bids"] or not ob["asks"]:
-            log_warn("orderbook empty, using ticker price")
-            price = get_ticker_safe(symbol)
-        else:
-            if side == "buy":
-                price = ob['asks'][0][0]
-            else:
-                price = ob['bids'][0][0]
+    params = build_order_params(pos_side, reduce_only=True)
 
-        order = ex.create_order(
-            symbol,
-            "market",
-            side,
-            qty,
-            None,
-            {"positionSide": pos_side}
-        )
-        log_g(f"✅ executed {signal} → {side} {qty:.6f} {symbol} @ approx {price:.6f}")
-        return order
-    except Exception as e:
-        log_error(f"execution fail: {e}")
-        return None
+    order = exchange.create_order(
+        symbol=symbol,
+        type="market",
+        side=close_side,
+        amount=qty,
+        params=params
+    )
+    log_g(f"✅ CLOSE {pos_side} | side={close_side} qty={qty:.6f} {symbol}")
+    return order
 
-# =================== LIVE EXECUTION ENGINE (FIXED CALLS) ===================
-def get_position_side(side):
-    # Kept for compatibility but should be avoided
-    return "LONG" if side.lower() == "buy" else "SHORT"
-
-def build_order_params(position_side):
-    return {"positionSide": position_side}
-
+# ------------------------------------------------------------
+# Execute market order (wrapper for external calls, uses unified params)
 def execute_market(symbol, side, amount, position_side, exchange=None):
     if exchange is None:
         exchange = globals().get("ex", None)
@@ -1341,7 +1361,7 @@ def execute_market(symbol, side, amount, position_side, exchange=None):
         return None
     try:
         rate_limit()
-        params = build_order_params(position_side)
+        params = build_order_params(position_side, reduce_only=False)
         order = exchange.create_order(
             symbol=symbol,
             type="market",
@@ -1362,7 +1382,7 @@ def execute_limit(symbol, side, amount, price, position_side, exchange=None):
         return None
     try:
         rate_limit()
-        params = build_order_params(position_side)
+        params = build_order_params(position_side, reduce_only=False)
         order = exchange.create_order(
             symbol=symbol,
             type="limit",
@@ -1384,7 +1404,7 @@ def execute_stop_market(symbol, side, amount, stop_price, position_side, exchang
         return None
     try:
         rate_limit()
-        params = build_order_params(position_side)
+        params = build_order_params(position_side, reduce_only=False)
         params["stopPrice"] = stop_price
         order = exchange.create_order(
             symbol=symbol,
@@ -1398,30 +1418,24 @@ def execute_stop_market(symbol, side, amount, stop_price, position_side, exchang
         log_event("ERROR", f"Stop market order failed: {e}")
         return None
 
-def close_with_retry(symbol, position, qty, max_retries=3):
-    close_side = "sell" if position["side"].lower() == "buy" else "buy"
-    pos_side = get_position_side(position["side"])
-    for attempt in range(max_retries):
-        order = execute_market(symbol, close_side, qty, pos_side)
-        if order:
-            log_event("INFO", f"Closed {position['side']} position on attempt {attempt+1}")
-            return True
-        log_event("WARN", f"Close attempt {attempt+1} failed")
-        time.sleep(1)
-    log_event("ERROR", "Failed to close position after retries")
-    return False
+# ------------------------------------------------------------
+# Legacy compatibility wrappers (use unified internally)
+def execute_trade_smart(symbol, signal, qty):
+    """Legacy wrapper – calls open_position."""
+    try:
+        return open_position(ex, symbol, signal, qty)
+    except Exception as e:
+        log_error(f"execution fail: {e}")
+        return None
 
 def execute_live_trade(exchange, symbol, signal, balance):
-    """Fixed: receives signal (LONG/SHORT) instead of side string."""
+    """Fixed: receives signal (LONG/SHORT)."""
     try:
         log_event("INFO", f"Start trade {symbol} {signal}")
         set_margin_mode(exchange, symbol, "ISOLATED")
-        side, pos_side = map_signal(signal)
-        if not side:
-            log_event("ERROR", f"Invalid signal {signal}")
-            return None
+        side, pos_side = resolve_direction(signal)
 
-        set_leverage_safe(symbol, LEVERAGE, pos_side)
+        set_leverage_safe(exchange, symbol, LEVERAGE, pos_side)
 
         price = get_ticker_safe(symbol)
         if not price:
@@ -1461,7 +1475,7 @@ def execute_live_trade(exchange, symbol, signal, balance):
             log_event("ERROR", "Order value validation failed")
             return None
 
-        order = execute_market(symbol, side, qty, pos_side, exchange)
+        order = open_position(exchange, symbol, signal, qty)
         if order is None:
             return None
 
@@ -1497,7 +1511,6 @@ def execute_trade_decision(signal, price, qty, mode, council_data, gz_data, sour
         log(f"DRY_RUN: {signal} {qty:.4f} @ {price:.6f} | mode={mode} | source={source}")
         return True
     if PAPER_MODE:
-        # Convert signal to side for paper
         side = "buy" if signal.upper() == "LONG" else "sell"
         paper_open(SYMBOL, side, price, qty)
         return True
@@ -1609,7 +1622,7 @@ def verify_execution_environment():
     log(f"🧪 PHASE + EXHAUSTION ENGINE: ACTIVE (prevents early reversals)")
     log(f"🚀 v17.3: +Safe Position, +Watchlist, +Liquidity Sweep, +HTF, +Fakeout Filter, +Smart Exit, +Trade Memory, +Adaptive Threshold, +Berlin TZ")
     log(f"🔥 INTEGRATED: Sniper Engine (Radar/Watchlist) + Monitoring + Auto-Recovery")
-    log(f"🔧 HOTFIX: Signal mapping unified - LONG/SHORT → correct positionSide always.")
+    log(f"🔧 REFACTOR: Unified Execution Layer (Single Source of Truth) – LONG=BUY=LONG, SHORT=SELL=SHORT")
     if not EXECUTE_ORDERS:
         log("🟡 WARNING: EXECUTE_ORDERS=False - analysis only!")
     if DRY_RUN:
@@ -3733,7 +3746,6 @@ def ensure_leverage_mode(symbol=None):
         symbol = SYMBOL
     try:
         try:
-            # For hedge mode, set leverage for both sides once (using "ALL")
             ex.set_leverage(LEVERAGE, symbol, params={"side": "ALL"})
             log_g(f"leverage set: {LEVERAGE}x for {symbol}")
         except Exception as e:
@@ -4433,7 +4445,8 @@ def move_stop_to_entry():
         if not pos:
             return
         pos_side = pos["side"]
-        params = {"positionSide": pos_side, "stopPrice": STATE["entry"]}
+        params = build_order_params(pos_side, reduce_only=False)
+        params["stopPrice"] = STATE["entry"]
         ex.create_order(
             symbol=SYMBOL,
             type="stop_market",
@@ -4454,7 +4467,8 @@ def update_stop_loss(new_price):
         if not pos:
             return
         pos_side = pos["side"]
-        params = {"positionSide": pos_side, "stopPrice": new_price}
+        params = build_order_params(pos_side, reduce_only=False)
+        params["stopPrice"] = new_price
         ex.create_order(
             symbol=SYMBOL,
             type="stop_market",
@@ -4501,14 +4515,10 @@ def close_partial(ratio):
         pos = get_real_position(SYMBOL)
         if not pos:
             return
-        side = "sell" if pos["side"] == "LONG" else "buy"
-        pos_side = pos["side"]
-        order = execute_market(SYMBOL, side, qty_to_close, pos_side)
-        if order:
-            STATE["remaining_qty"] -= qty_to_close
-            log_g(f"💰 Partial close {ratio*100:.0f}% executed")
-        else:
-            log_warn("Partial close failed")
+        # Use unified close_position (reduce_only=True) with specific qty
+        close_position(ex, SYMBOL, qty=qty_to_close)
+        STATE["remaining_qty"] -= qty_to_close
+        log_g(f"💰 Partial close {ratio*100:.0f}% executed")
 
 def close_position_strict():
     for attempt in range(3):
@@ -4721,11 +4731,15 @@ def get_trade_target(df, side):
     else:
         return None
 
-# =================== TELEGRAM SYSTEM ===================
+# =================== TELEGRAM SYSTEM (RELIABLE) ===================
 import requests
 
 TG_TOKEN = CONFIG.TG_TOKEN
 TG_CHAT  = CONFIG.TG_CHAT_ID
+
+_last_tg_open_time = 0
+_last_tg_close_time = 0
+TG_THROTTLE_SEC = 2
 
 def tg_send(msg):
     if not TG_TOKEN or not TG_CHAT:
@@ -4754,6 +4768,12 @@ def tg_boot():
 """)
 
 def tg_open(symbol, side, price, ctx):
+    global _last_tg_open_time
+    now = time.time()
+    if now - _last_tg_open_time < TG_THROTTLE_SEC:
+        return
+    _last_tg_open_time = now
+
     icon = "🟢" if side == "LONG" else "🔴"
     msg = f"""
 {icon} <b>NEW TRADE</b>
@@ -4773,8 +4793,15 @@ DI Spread: {ctx.get('di_spread')}
 {ctx.get('reason')}
 """
     tg_send(msg)
+    play_sound("open")
 
 def tg_close(symbol, side, pnl):
+    global _last_tg_close_time
+    now = time.time()
+    if now - _last_tg_close_time < TG_THROTTLE_SEC:
+        return
+    _last_tg_close_time = now
+
     icon = "💰" if pnl >= 0 else "🔻"
     msg = f"""
 {icon} <b>CLOSE TRADE</b>
@@ -4784,9 +4811,11 @@ def tg_close(symbol, side, pnl):
 📉 PNL: {pnl:.2f}%
 """
     tg_send(msg)
+    play_sound("close")
 
 def tg_error(e):
     tg_send(f"🚨 <b>ERROR</b>\n{str(e)}")
+    play_sound("error")
 
 def tg_mismatch(decision, real):
     tg_send(f"""
@@ -5275,7 +5304,6 @@ def smart_scan_and_trade():
     return False
 
 # =================== SNIPER ENGINE (RADAR + WATCHLIST + DASHBOARD) ===================
-# ---------- FIX: Define _ema globally for sniper functions ----------
 def _ema(arr, period):
     """Exponential Moving Average helper for Sniper Engine."""
     k = 2 / (period + 1)
@@ -5286,7 +5314,6 @@ def _ema(arr, period):
         else:
             ema.append(v * k + ema[-1] * (1 - k))
     return ema
-# --------------------------------------------------------------------
 
 SNIPER_WATCHLIST = {}   # symbol -> dict
 SNIPER_LIQUIDITY_MAP = {} # symbol -> {high, low, time}
@@ -5295,15 +5322,12 @@ SNIPER_MAX_WATCH = 30
 SNIPER_TOP_N = 5
 LAST_RADAR_TIME = 0
 
-# ✅ ADDED: Sniper Only Modification - Non‑Blocking Priority Queue
 sniper_queue = []  # each item: {symbol, side, score, created_at, recheck_at}
 
 def add_to_sniper_queue(symbol, side, score, next_candle_time):
     """Insert a sniper opportunity into the queue."""
-    # avoid duplicates
     for item in sniper_queue:
         if item["symbol"] == symbol:
-            # update if newer/better
             if score > item["score"]:
                 item["score"] = score
                 item["side"] = side
@@ -5317,13 +5341,11 @@ def add_to_sniper_queue(symbol, side, score, next_candle_time):
         "created_at": time.time(),
         "recheck_at": next_candle_time,
     })
-    # keep queue size limited and sorted by score
     sniper_queue.sort(key=lambda x: x["score"], reverse=True)
     if len(sniper_queue) > 20:
         sniper_queue.pop()
 
 def process_sniper_queue():
-    """Check queued items whose recheck time has passed, confirm and execute."""
     now = time.time()
     to_remove = []
     for item in list(sniper_queue):
@@ -5333,24 +5355,20 @@ def process_sniper_queue():
         side = item["side"]
         original_score = item["score"]
 
-        # Fetch latest data (after candle close)
         df = get_ohlcv_safe(symbol, timeframe=INTERVAL, limit=120)
         if df is None or len(df) < 3:
             log_warn(f"⚠️ Sniper queue: {symbol} data fetch failed, skipping")
             to_remove.append(item)
             continue
 
-        # Get confirmation candles (previous = signal candle, current = confirmation candle)
-        prev_candle = df.iloc[-2]   # signal candle (when opportunity was detected)
-        confirm_candle = df.iloc[-1] # new closed candle
+        prev_candle = df.iloc[-2]
+        confirm_candle = df.iloc[-1]
 
-        # ✅ ADDED: Sniper confirmation logic (same as before but without wait)
         if not confirm_sniper_entry(side, prev_candle, confirm_candle, df):
             log_warn(f"⛔ SNIPER SKIPPED: {symbol} | side={side} | score={original_score} (confirmation failed)")
             to_remove.append(item)
             continue
 
-        # All checks passed – execute trade
         price = confirm_candle.close
         qty = calculate_position_size_real(symbol, price, original_score)
         if qty <= 0:
@@ -5365,7 +5383,7 @@ def process_sniper_queue():
 
         log_g(f"🚀 SNIPER EXECUTED: {symbol} | {side.upper()} | score={original_score}")
         success = open_market_enhanced(
-            side,  # side is already LONG/SHORT from queue
+            side,
             qty, price,
             source="SNIPER_QUEUE",
             df=df,
@@ -5373,26 +5391,18 @@ def process_sniper_queue():
             breakdown={"engine": "sniper_queue"}
         )
         if success:
-            # If trade opened, we stop processing further queue items to avoid multiple trades
             to_remove.append(item)
-            # Clean up the rest later (or keep them for next loop)
             break
         else:
             to_remove.append(item)
 
-    # Remove processed items
     for item in to_remove:
         if item in sniper_queue:
             sniper_queue.remove(item)
 
 def confirm_sniper_entry(side, prev_candle, confirm_candle, df=None):
-    """
-    Professional confirmation of sniper setup.
-    Checks: candle strength, manipulation, continuation, momentum.
-    Returns True if confirmed.
-    """
     if prev_candle is None or confirm_candle is None:
-        return True  # fail-safe
+        return True
 
     body = abs(confirm_candle.close - confirm_candle.open)
     candle_range = confirm_candle.high - confirm_candle.low
@@ -5406,7 +5416,6 @@ def confirm_sniper_entry(side, prev_candle, confirm_candle, df=None):
     is_bullish = confirm_candle.close > confirm_candle.open
     is_bearish = confirm_candle.close < confirm_candle.open
 
-    # 1. Manipulation detection (long wicks)
     if side.lower() == "buy":
         if upper_wick > body * 1.8:
             log("⛔ Sniper manipulation: long upper wick (bull trap)")
@@ -5416,12 +5425,10 @@ def confirm_sniper_entry(side, prev_candle, confirm_candle, df=None):
             log("⛔ Sniper manipulation: long lower wick (bear trap)")
             return False
 
-    # 2. Candle strength (needs solid body)
     if body_ratio < 0.5:
         log(f"⛔ Sniper weak candle: body_ratio={body_ratio:.2f}")
         return False
 
-    # 3. Direction and continuation
     if side.lower() == "buy":
         if not is_bullish:
             log("⛔ Sniper confirmation candle is not bullish")
@@ -5437,7 +5444,6 @@ def confirm_sniper_entry(side, prev_candle, confirm_candle, df=None):
             log("⛔ Sniper close did not break previous low")
             return False
 
-    # 4. Additional sweep check
     if df is not None and len(df) > 3:
         sweep = detect_stop_hunt(df)
         if sweep:
@@ -5685,13 +5691,12 @@ def sniper_execution():
             sig = SNIPER_WATCHLIST[s]["signal"]
             if sig:
                 monitor_log_warning(f"🔥 SNIPER → {s} | {sig} | Score={sc}")
-                # execute trade using bot's function
                 df = sniper_fetch_ohlcv(s)
                 price = df["close"].iloc[-1]
                 qty = calculate_position_size_real(s, price, sc)
                 if qty > 0 and update_symbol(s):
                     open_market_enhanced(
-                        sig,  # already "BUY" or "SELL" -> map to LONG/SHORT later
+                        sig,
                         qty, price,
                         source="SNIPER_ENGINE",
                         df=df,
@@ -5702,9 +5707,8 @@ def sniper_execution():
 
 # =================== RADAR ENGINE (NEW) ===================
 def radar_engine(symbols):
-    """First stage: scan for low ADX coins to add to WATCHLIST."""
     global WATCHLIST, WATCHLIST_META
-    for s in symbols[:50]:  # limit to 50 per radar scan
+    for s in symbols[:50]:
         df = get_ohlcv_safe(s)
         if df is None or df.empty:
             continue
@@ -5721,7 +5725,6 @@ def radar_engine(symbols):
     log_i(f"📡 RADAR FOUND: {len(WATCHLIST)} coins")
 
 def sniper_engine():
-    """Second stage: analyze WATCHLIST for high probability setups."""
     candidates = []
     for s in list(WATCHLIST):
         df = get_ohlcv_safe(s)
@@ -5744,9 +5747,7 @@ def sniper_engine():
 
 # =================== TRADE MANAGEMENT ===================
 
-# ✅ ADDED: Entry Exhaustion Filter (Stochastic computation)
 def compute_stoch_k(df, k_period=14, d_period=3):
-    """Compute Stochastic %K line from dataframe (non-intrusive)."""
     if len(df) < k_period:
         return 50.0
     high = df['high'].astype(float)
@@ -5772,16 +5773,13 @@ def allow_entry_pro(side, rsi, stoch_k, adx, candle):
 
     bear_reject, bull_reject = is_rejection_candle(candle)
 
-    # allow in strong trend
     if adx >= STRONG_TREND:
         return True
 
-    # block BUY at exhaustion top
     if side == "buy":
         if rsi >= 70 and stoch_k > 80 and bear_reject:
             return False
 
-    # block SELL at exhaustion bottom
     if side == "sell":
         if rsi <= 30 and stoch_k < 20 and bull_reject:
             return False
@@ -5817,17 +5815,15 @@ def open_market_enhanced(signal, qty, price, source="INSTITUTIONAL", df=None, in
     current_market_regime = get_market_regime_from_adx(adx)
     target_price = get_trade_target(df, signal)
 
-    # ✅ ADDED: Entry Filter Guard (Exhaustion + Rejection)
     try:
         if df is not None and len(df) > 0:
             last_candle = df.iloc[-1]
-            stoch_k = compute_stoch_k(df)  # compute locally without affecting existing pipeline
-            side_order, _ = map_signal(signal)  # get "buy"/"sell" for filter
+            stoch_k = compute_stoch_k(df)
+            side_order, _ = resolve_direction(signal)
             if side_order and not allow_entry_pro(side_order, rsi, stoch_k, adx, last_candle):
                 log(f"⛔ Skip {signal}: Exhaustion + Rejection Filter (RSI={rsi:.1f} StochK={stoch_k:.1f} ADX={adx:.1f})")
                 return False
     except Exception as e:
-        # fail-safe: if any error during filter check, allow entry
         log_warn(f"Entry filter check failed (skipping filter): {e}")
 
     success = execute_trade_decision(signal, price, qty, "institutional", None, None, source)
@@ -5890,7 +5886,6 @@ def open_market_enhanced(signal, qty, price, source="INSTITUTIONAL", df=None, in
             "reason": source
         }
         tg_open(SYMBOL, STATE["side"].upper(), price, ctx)
-        play_sound("open")
         return True
     return False
 
@@ -5920,12 +5915,7 @@ def strict_close_position(reason="CLOSE"):
         log_trade_memory(SYMBOL, side.upper(), pnl_pct, STATE.get("entry_score", 0))
         sync_account_state()
 
-        if pnl > 0:
-            tg_close(SYMBOL, side.upper(), pnl_pct)
-            play_sound("close")
-        else:
-            tg_close(SYMBOL, side.upper(), pnl_pct)
-            play_sound("close")
+        tg_close(SYMBOL, side.upper(), pnl_pct)
     else:
         log_e("❌ forced close failed")
         new_bal = balance_usdt() or 0
@@ -5957,11 +5947,10 @@ def close_market_strict(reason="STRICT"):
 def _reset_after_close(reason, prev_side=None):
     global wait_for_next_signal_side
     prev_side = prev_side or STATE.get("side")
-    # Reset all position-related fields to safe values
     STATE.update({
         "open": False,
         "side": None,
-        "entry": None,          # Ensure None to prevent calculation errors
+        "entry": None,
         "qty": 0.0,
         "remaining_qty": 0.0,
         "tp1_done": False,
@@ -6090,7 +6079,6 @@ def manage_profit_system(price, ind):
     global STATE
     if not STATE.get("open"):
         return
-    # Additional safety: ensure entry is not None before proceeding
     entry = STATE.get("entry")
     if entry is None:
         log_warn("manage_profit_system: entry is None, skipping")
@@ -6142,17 +6130,14 @@ def trade_loop():
                 time.sleep(60)
                 continue
 
-            # Radar Engine (every 20 minutes)
             if now - last_radar_time >= 1200:
                 if SYMBOLS:
                     radar_engine(SYMBOLS[:50])
                     last_radar_time = now
                     log("🔎 RADAR SCAN COMPLETED")
 
-            # ✅ ADDED: Sniper Only Modification - Queue Processing (Non‑Blocking)
             process_sniper_queue()
 
-            # Sniper Engine (every loop) - now only adds to queue, does not execute
             if not has_open_position() and WATCHLIST:
                 snipes = sniper_engine()
                 for sym, score in snipes:
@@ -6161,17 +6146,14 @@ def trade_loop():
                     if df is None or df.empty:
                         continue
 
-                    # Determine side via evaluate_sniper
                     signal = evaluate_sniper(sym, df)
                     if not signal:
                         continue
                     side = "BUY" if signal == "LONG" else "SELL"
 
-                    # Calculate next candle close time
                     sec_to_close = time_to_candle_close(df)
-                    next_recheck = time.time() + sec_to_close + 5  # add small buffer
+                    next_recheck = time.time() + sec_to_close + 5
 
-                    # ✅ ADDED: Sniper Queue Insert (Non‑Blocking + Visual Tag)
                     add_to_sniper_queue(sym, side, score, next_recheck)
                     log(f"👁️ SNIPER QUEUED: {sym} | side={side} | score={score} | recheck in ~{sec_to_close}s")
 
@@ -6197,7 +6179,6 @@ def trade_loop():
                     manage_profit_system(px, ind)
                 if now - LAST_LOG > LOG_INTERVAL:
                     if px:
-                        # --- FIX: Guard against None entry ---
                         entry = STATE.get("entry")
                         qty = STATE.get("remaining_qty") or STATE.get("qty")
                         side = STATE.get("side")
@@ -6257,7 +6238,7 @@ def trade_loop():
                                 if update_symbol(sym):
                                     log_g(f"🔥 SNIPER ENTRY → {sym} {signal}")
                                     success = open_market_enhanced(
-                                        signal,  # signal already LONG/SHORT
+                                        signal,
                                         qty, price,
                                         source="SNIPER_INSTITUTIONAL",
                                         df=df,
@@ -6861,7 +6842,7 @@ def keep_alive():
                 requests.get(CONFIG.SELF_URL + "/health")
         except:
             pass
-        time.sleep(300)  # كل 5 دقائق
+        time.sleep(300)
 
 def tg_send_start():
     try:
@@ -7014,7 +6995,7 @@ def initialize_bot():
     print(colored(f"FIX: ensure_leverage_mode uses side='ALL' for Hedge Mode compatibility", "green"))
     print(colored(f"ADDED: Entry Exhaustion Filter (RSI/StochK + Rejection) to prevent bad entries", "green"))
     print(colored(f"ADDED: Sniper Non‑Blocking Priority Queue + 👁️ Visual Tag", "green"))
-    print(colored(f"HOTFIX: Unified signal mapping (map_signal) – LONG/SHORT always correct, 101205 fixed.", "green"))
+    print(colored(f"REFACTOR: Unified Execution Layer — LONG=BUY=LONG, SHORT=SELL=SHORT, 101205 fixed.", "green"))
     tg_boot()
 
 if __name__ == "__main__":

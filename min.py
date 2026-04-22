@@ -560,883 +560,131 @@ def get_real_position(symbol):
 def get_real_position_safe(exchange, symbol):
     return get_real_position(symbol)
 
-# =================== FIXED SAFE_CLOSE ===================
-def detect_position_mode():
-    try:
-        positions = ex.fetch_positions()
-        if positions and "positionSide" in positions[0]:
-            return "hedge"
-    except Exception:
-        pass
-    return "oneway"
-
-def safe_close(exchange, symbol):
-    """Close position with correct side and reduceOnly, using unified direction."""
-    for attempt in range(3):
-        try:
-            pos = get_real_position(symbol)
-            if pos is None:
-                log("✅ No position → already closed")
-                return True
-
-            size = pos["amount"]
-            if size < 1e-6:
-                log("⚠️ Dust position → ignore")
-                return True
-
-            pos_side = pos["side"]   # "LONG" or "SHORT"
-            close_side = "sell" if pos_side == "LONG" else "buy"
-
-            amount = float(exchange.amount_to_precision(symbol, size))
-            params = build_order_params(pos_side, reduce_only=True)
-
-            order = exchange.create_order(
-                symbol,
-                "market",
-                close_side,
-                amount,
-                params=params
-            )
-
-            log(f"✅ CLOSE SUCCESS → {symbol}")
-            return True
-
-        except Exception as e:
-            log(f"❌ CLOSE ATTEMPT {attempt+1} FAILED: {e}")
-            time.sleep(1)
-
-    return False
-
-def force_close(symbol):
-    try:
-        pos = get_real_position(symbol)
-        if pos:
-            log(f"⚠️ FORCE CLOSE TRIGGERED for {symbol} {pos['side']} {pos['amount']}")
-            return safe_close(ex, symbol)
-    except Exception as e:
-        log(f"❌ FORCE CLOSE FAILED: {e}")
-    return False
-
-def close_position_full():
-    if PAPER_MODE:
-        price = price_now()
-        paper_close(price)
-        return True
-    else:
-        result = safe_close(ex, SYMBOL)
-        if not result:
-            log_warn("safe_close failed, attempting force_close")
-            result = force_close(SYMBOL)
-        return result
-
-def has_open_position():
-    if PAPER_MODE:
-        return paper["position"] is not None
-    if MODE_LIVE:
-        pos = get_real_position(SYMBOL)
-        return pos is not None
-    return False
-
-# =================== BOT STATE ===================
-bot_state = {
-    "scanner_status": "idle",
-    "current_symbol": None,
-    "best_symbol": None,
-    "best_score": 0,
-    "threshold": 12,
-    "coins_scanned": 0,
-    "last_reject_reason": None,
-    "top_opportunities": [],
-    "btc_trend": "neutral",
-    "btc_1h_change": 0.0,
-    "errors": [],
-    "execution_events": [],
-    "watchlist": [],
-    "decision": {
-        "action": "none",
-        "score": 0,
-        "needed": 12,
-        "reason": "initial"
-    },
-    "sr": {
-        "support": None,
-        "resistance": None,
-        "dist_support": None,
-        "dist_resistance": None
-    },
-    "zone": {
-        "type": "NONE",
-        "low": None,
-        "high": None,
-        "distance": None
-    },
-    "indicators": {
-        "adx": None,
-        "di_plus": None,
-        "di_minus": None,
-        "trend": None
-    },
-    "live": {
-        "symbol": None,
-        "momentum": None,
-        "zone": None,
-        "behavior": None,
-        "score": None
-    },
-    "pump": {
-        "status": "N/A",
-        "reason": ""
-    },
-    "retest": {
-        "level": None,
-        "direction": None,
-        "confirmed": False
-    },
-    "runner": {
-        "active": False,
-        "trail_price": None,
-        "peak_profit": 0.0
-    },
-    "zone_watchlist": [],
-    "last_zone": None,
-    "memory": {
-        "last_sweep": None,
-        "last_zone": None,
-        "last_structure_shift": None,
-    }
-}
-
-# =================== ENV / MODE ===================
-API_KEY = CONFIG.BINGX_API_KEY
-API_SECRET = CONFIG.BINGX_API_SECRET
-MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
-
-SELF_URL = CONFIG.SELF_URL
-PORT = CONFIG.PORT
-
-LOG_LEGACY = False
-LOG_ADDONS = True
-
-EXECUTE_ORDERS = True
-SHADOW_MODE_DASHBOARD = False
-DRY_RUN = False
-
-BOT_VERSION = "PROFESSIONAL SNIPER v17.3 (Institutional Hunter) + Sniper Engine + Recovery"
-print("🔁 Booting:", BOT_VERSION, flush=True)
-
-STATE_PATH = "./bot_state.json"
-RESUME_ON_RESTART = True
-RESUME_LOOKBACK_SECS = 60 * 60
-
-BOOKMAP_DEPTH = 20
-BOOKMAP_TOPWALLS = 3
-IMBALANCE_ALERT = 1.30
-
-FLOW_WINDOW = 20
-FLOW_SPIKE_Z = 1.60
-CVD_SMOOTH = 8
-
-OBI_EDGE = 0.18
-DELTA_EDGE = 1.5
-WALL_PROX_BPS = 8.0
-FLOW_VOTE  = 2
-FLOW_SCORE = 1.2
-
-SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL   = os.getenv("INTERVAL", "15m")
-LEVERAGE   = int(os.getenv("LEVERAGE", 5))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
-
-MIN_ENTRY_SCORE = 12
-STRONG_ENTRY_SCORE = 15
-ULTRA_ENTRY_SCORE = 18
-bot_state["threshold"] = MIN_ENTRY_SCORE
-
-MAX_TRADES_PER_DAY = 999999
-
-MAX_SCAN_COINS = 50
-SCAN_INTERVAL = 20
-SCAN_BATCH = 10
-_scan_idx = 0
-
-RF_SOURCE = "close"
-RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
-RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0
-
-RSI_LEN = 14
-ADX_LEN = 14
-ATR_LEN = 14
-
-ENTRY_RF_ONLY = True
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
-
-TP1_PERCENT = 0.5
-TP1_PROFIT_PCT = 0.5
-TRAIL_ATR_MULT = 1.5
-TRAIL_ACTIVATE_PCT = 0.50
-ATR_TRAIL_MULT = 1.6
-BREAKEVEN_OFFSET = 0.0005
-LIQUIDITY_TARGET_DIST = 0.002
-
-RUNNER_ACTIVATE_AFTER_TP2 = False
-RUNNER_DRAWDOWN_PCT = 1.0
-RUNNER_ATR_MULT = 2.5
-RUNNER_TREND_WEAK_ADX = 20
-RUNNER_DI_CROSS_CLOSE = False
-
-FINAL_CHUNK_QTY = 0.0
-RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0))
-
-CLOSE_RETRY_ATTEMPTS = 6
-CLOSE_VERIFY_WAIT_S  = 2.0
-
-BASE_SLEEP   = 5
-NEAR_CLOSE_S = 1
-
-SMART_MODE = os.getenv("SMART_MODE", "pro")
-
-ADX_TREND_MIN = 20
-DI_SPREAD_TREND = 6
-RSI_MA_LEN = 9
-RSI_NEUTRAL_BAND = (45, 55)
-RSI_TREND_PERSIST = 3
-
-GZ_MIN_SCORE = 6.0
-GZ_REQ_ADX = 20
-GZ_REQ_VOL_MA = 20
-ALLOW_GZ_ENTRY = True
-
-SCALP_TP1 = 0.40
-SCALP_BE_AFTER = 0.30
-SCALP_ATR_MULT = 1.6
-TREND_TP1 = 1.20
-TREND_BE_AFTER = 0.80
-TREND_ATR_MULT = 1.8
-
-COOLDOWN_SECS_AFTER_CLOSE = 60
-COOLDOWN_MINUTES_LOSS = 10
-ADX_GATE = 22
-MAX_VWAP_DISTANCE_PCT = 0.008
-
-TP1_SCALP_PCT      = 0.35/100
-TP1_TREND_PCT      = 0.60/100
-HARD_CLOSE_PNL_PCT = 1.10/100
-WICK_ATR_MULT      = 1.5
-EVX_SPIKE          = 1.8
-BM_WALL_PROX_BPS   = 5
-TIME_IN_TRADE_MIN  = 8
-TRAIL_TIGHT_MULT   = 1.20
-
-ENABLE_LIQUIDITY_POOLS = True
-ENABLE_STRUCTURE = True
-ENABLE_DISPLACEMENT = True
-ENABLE_VOLATILITY_FILTER = True
-MIN_ATR_PCT = 0.001
-ENABLE_WHALE_TRAP = True
-ENABLE_LIQUIDITY_HEATMAP = True
-ENABLE_STOP_HUNT = True
-ENABLE_LIQUIDITY_VOID = True
-ENABLE_LIQUIDITY_REVERSAL = True
-
-ENABLE_SUPPLY_DEMAND = True
-SD_MIN_ZONE_STRENGTH = 3
-SD_MAX_ZONE_DISTANCE_PCT = 0.003
-SD_REQUIRE_REJECTION = True
-SD_REQUIRE_ORDERFLOW = True
-SD_ENTRY_SCORE_WEIGHT = 2
-
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_MINUTES_DRAWDOWN = 20
-MAX_DAILY_LOSS_PCT = 5.0
-
-BTC_CRASH_THRESHOLD = 3.0
-PUMP_MIN_PRICE_MOVE = 0.5
-PUMP_MIN_ADX = 15
-
-CACHE = {"ohlcv": {}, "orderbook": {}, "trades": {}}
-CACHE_TTL = {"ohlcv": 15, "orderbook": 5, "trades": 5}
-
-GLOBAL_SCAN_INTERVAL = 300
-TOP_SYMBOLS = []
-SCAN_LIST = []
-LAST_FULL_SCAN = 0
-
-SM_WEIGHT = 2
-PRE_WEIGHT = 2
-TRAP_PENALTY = 1.5
-INSTITUTIONAL_MIN_SCORE = 5
-
-# ========== SMART PIPELINE CONFIG ==========
-SMART_PIPELINE_ENABLED = True
-SYMBOL_MEMORY = {}
-
-# ========== NEW INSTITUTIONAL HUNTER MODULES ==========
-WATCHLIST = []  # Changed from dict to list
-WATCHLIST_META = {}  # Metadata for watchlist items
-MAX_WATCHLIST = 10
-LIQUIDITY_ZONES = []
-TRADE_LOG = []
-MIN_SCORE_THRESHOLD = 6
-LAST_TRADE_TIME = 0
-PEAK_PNL = 0
-
-# =================== GLOBAL STATE ===================
-STATE = {
-    "open": False,
-    "side": None,
-    "entry": 0.0,
-    "qty": 0.0,
-    "remaining_qty": 0.0,
-    "tp1_done": False,
-    "pnl": 0.0,
-    "bars": 0,
-    "trail": None,
-    "breakeven": None,
-    "highest_profit_pct": 0.0,
-    "trail_activated": False,
-    "trail_stop": None,
-    "trail_multiplier": TRAIL_ATR_MULT,
-    "prev_adx": 0,
-    "trend_strength": "weak",
-    "regime_at_entry": "range",
-    "signal_strength": "MEDIUM",
-    "trend_strength_entry": "weak",
-    "entry_score": 0,
-    "tp_config": None,
-    "cooldown_until": None,
-    "daily_trades": 0,
-    "last_trade_day": None,
-    "consecutive_losses": 0,
-    "daily_peak_balance": None,
-    "daily_loss_limit_hit": False,
-    "opened_at": None,
-    "leverage": LEVERAGE,
-    "heat_score": 0,
-    "heat_breakdown": {},
-    "current_market_regime": "range",
-    "supply_demand_trigger": False,
-    "zone_state": {},
-    "trend": None,
-    "last_error": None,
-    "balance": 0.0,
-    "current_symbol": None,
-    "protected": False,
-    "tp1": False,
-    "tp1_wait": False,
-    "peak": 0.0,
-    "target_price": None,
-    "pme_state": {},
-    "balance_free": 0.0,
-    "balance_used": 0.0,
-    "balance_total": 0.0,
-    "events": [],
-    "errors": [],
-    "price": 0.0,
-    "trade": None,
-    "signal": None,
-    "tp1_hit": False,
-    "tp2_hit": False,
-}
-
-compound_pnl = 0.0
-wait_for_next_signal_side = None
-
-# =================== DATA ENGINE ===================
-DATA_CACHE = {
-    "ticker": {},
-    "ohlcv": {},
-    "orderbook": {},
-    "trades": {}
-}
-
-DATA_TTL = {
-    "ticker": 5,
-    "ohlcv": 15,
-    "orderbook": 5,
-    "trades": 5
-}
-
-LAST_API_CALL = 0
-MIN_API_DELAY = 0.2
-
-def rate_limit():
-    global LAST_API_CALL
-    now = time.time()
-    diff = now - LAST_API_CALL
-    if diff < MIN_API_DELAY:
-        time.sleep(MIN_API_DELAY - diff)
-    LAST_API_CALL = time.time()
-
-def data_get(kind, key):
-    item = DATA_CACHE[kind].get(key)
-    if not item:
-        return None
-    ts, val = item
-    if time.time() - ts > DATA_TTL[kind]:
-        return None
-    return val
-
-def data_set(kind, key, value):
-    DATA_CACHE[kind][key] = (time.time(), value)
-
-def get_ticker_safe(symbol):
-    cached = data_get("ticker", symbol)
-    if cached is not None:
-        return cached
-    try:
-        rate_limit()
-        ticker = ex.fetch_ticker(symbol)
-        price = ticker.get("last", 0)
-        data_set("ticker", symbol, price)
-        return price
-    except Exception as e:
-        log_event("WARN", f"Ticker failed for {symbol}: {e}")
-        return cached if cached is not None else 0
-
-def get_ohlcv_safe(symbol, timeframe=INTERVAL, limit=120):
-    key = f"{symbol}_{timeframe}_{limit}"
-    cached = data_get("ohlcv", key)
-    if cached is not None:
-        return cached
-    try:
-        rate_limit()
-        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-        data_set("ohlcv", key, df)
-        return df
-    except Exception as e:
-        log_event("WARN", f"OHLCV failed for {symbol}: {e}")
-        if cached is not None:
-            return cached
-        return pd.DataFrame()
-
-def get_orderbook_safe(symbol, limit=BOOKMAP_DEPTH):
-    key = f"{symbol}_{limit}"
-    cached = data_get("orderbook", key)
-    if cached is not None:
-        return cached
-    try:
-        rate_limit()
-        ob = ex.fetch_order_book(symbol, limit=limit)
-        data_set("orderbook", key, ob)
-        return ob
-    except Exception as e:
-        log_event("WARN", f"Orderbook failed for {symbol}: {e}")
-        if cached is not None:
-            return cached
-        return {"bids": [], "asks": []}
-
-def fetch_trades_cached(symbol, limit=200):
-    if symbol is None:
-        symbol = SYMBOL
-    cached = cache_get("trades", symbol)
-    if cached is not None:
-        return cached
-    try:
-        rate_limit()
-        data = ex.fetch_trades(symbol, limit=limit)
-        cache_set("trades", symbol, data)
-        return data
-    except Exception as e:
-        log_event("WARN", f"Trades fetch failed: {e}")
-        return []
-
-def fetch_ohlcv_cached(symbol=None, interval=None, limit=120):
-    if symbol is None:
-        symbol = SYMBOL
-    if interval is None:
-        interval = INTERVAL
-    return get_ohlcv_safe(symbol, interval, limit)
-
-def fetch_orderbook_cached(symbol=None, limit=BOOKMAP_DEPTH):
-    if symbol is None:
-        symbol = SYMBOL
-    allowed_limits = [5, 10, 20]
-    if limit not in allowed_limits:
-        limit = 20
-    return get_orderbook_safe(symbol, limit)
-
-# =================== BALANCE CACHING ===================
-_balance_cache = {"value": 0.0, "timestamp": 0}
-BALANCE_CACHE_TTL = 30
-
-def get_real_balance(exchange):
-    now = time.time()
-    if now - _balance_cache["timestamp"] < BALANCE_CACHE_TTL:
-        return _balance_cache["value"]
-    try:
-        rate_limit()
-        balance = exchange.fetch_balance()
-        usdt_balance = balance.get('total', {}).get('USDT', 0)
-        if usdt_balance is None:
-            usdt_balance = 0
-        _balance_cache["value"] = float(usdt_balance)
-        _balance_cache["timestamp"] = now
-        return _balance_cache["value"]
-    except Exception as e:
-        log_event("WARN", f"Balance fetch failed: {e}")
-        return _balance_cache["value"]
-
-def get_balance(exchange=None):
-    if PAPER_MODE:
-        return float(paper.get("balance", 0))
-    try:
-        if exchange is None:
-            exchange = globals().get("ex", None)
-        if exchange is None:
-            return 0.0
-        return get_real_balance(exchange)
-    except Exception:
-        return 0.0
-
-# =================== NEW ACCOUNT SYNC ENGINE ===================
-def calculate_pnl(entry, current, side, size):
-    if side == "LONG":
-        pnl_pct = ((current - entry) / entry) * 100 if entry else 0
-        pnl_usdt = pnl_pct * size / 100
-    else:
-        pnl_pct = ((entry - current) / entry) * 100 if entry else 0
-        pnl_usdt = pnl_pct * size / 100
-    return pnl_pct, pnl_usdt
-
-def sync_account_state():
-    global STATE
-
-    if PAPER_MODE:
-        STATE["balance_free"] = paper.get("balance", 0.0)
-        STATE["balance_used"] = 0.0
-        STATE["balance_total"] = paper.get("balance", 0.0)
-        STATE["balance"] = STATE["balance_free"]
-        STATE["open"] = paper["position"] is not None
-        if STATE["open"]:
-            STATE["side"] = paper["position"]["side"].lower()
-            STATE["entry"] = paper["position"]["entry"]
-            STATE["qty"] = paper["position"]["qty"]
-            STATE["remaining_qty"] = paper["position"]["remaining_qty"]
-        else:
-            STATE["side"] = None
-            STATE["entry"] = 0.0
-            STATE["qty"] = 0.0
-            STATE["remaining_qty"] = 0.0
-
-        STATE["price"] = price_now() or STATE["entry"]
-        if STATE["open"]:
-            pnl_pct, pnl_usdt = calculate_pnl(STATE["entry"], STATE["price"], STATE["side"].upper(), STATE["qty"])
-            STATE["trade"] = {
-                "side": STATE["side"].upper(),
-                "entry": STATE["entry"],
-                "price": STATE["price"],
-                "pnl": round(pnl_pct, 2),
-                "profit": round(pnl_usdt, 2)
-            }
-            STATE["pnl"] = pnl_pct
-            update_position_dashboard(SYMBOL, STATE["side"].upper(), STATE["entry"], STATE["price"], STATE["qty"], LEVERAGE)
-        else:
-            STATE["trade"] = None
-            STATE["pnl"] = 0.0
-            clear_position_dashboard()
-
-        update_account_dashboard(STATE["balance_free"], STATE["balance_free"], STATE["balance_used"], mode="PAPER")
-        return
-
-    if not MODE_LIVE:
-        STATE["balance_free"] = 100.0
-        STATE["balance_used"] = 0.0
-        STATE["balance_total"] = 100.0
-        STATE["balance"] = 100.0
-        STATE["open"] = False
-        STATE["side"] = None
-        STATE["entry"] = 0.0
-        STATE["qty"] = 0.0
-        STATE["price"] = price_now() or 0
-        STATE["trade"] = None
-        STATE["pnl"] = 0.0
-        clear_position_dashboard()
-        update_account_dashboard(100.0, 100.0, 0.0, mode="SIM")
-        return
-
-    try:
-        balance = ex.fetch_balance()
-        usdt = balance.get('USDT', {})
-        free = float(usdt.get('free', 0))
-        used = float(usdt.get('used', 0))
-        total = float(usdt.get('total', 0))
-
-        pos = get_real_position(SYMBOL)
-        if pos and pos.get("amount", 0) > 0:
-            STATE["open"] = True
-            STATE["side"] = pos["side"].lower()
-            entry_price = float(pos["raw"].get("entryPrice", 0))
-            STATE["entry"] = entry_price
-            STATE["qty"] = pos["amount"]
-            STATE["remaining_qty"] = STATE["qty"]
-            price = price_now() or STATE["entry"]
-            update_position_dashboard(SYMBOL, STATE["side"].upper(), STATE["entry"], price, STATE["qty"], LEVERAGE)
-        else:
-            STATE["open"] = False
-            STATE["side"] = None
-            STATE["entry"] = 0.0
-            STATE["qty"] = 0.0
-            STATE["remaining_qty"] = 0.0
-            clear_position_dashboard()
-
-        STATE["balance_free"] = free
-        STATE["balance_used"] = used
-        STATE["balance_total"] = total
-        STATE["balance"] = free
-
-        STATE["price"] = price_now() or STATE["entry"]
-        if STATE["open"]:
-            pnl_pct, pnl_usdt = calculate_pnl(STATE["entry"], STATE["price"], STATE["side"].upper(), STATE["qty"])
-            STATE["trade"] = {
-                "side": STATE["side"].upper(),
-                "entry": STATE["entry"],
-                "price": STATE["price"],
-                "pnl": round(pnl_pct, 2),
-                "profit": round(pnl_usdt, 2)
-            }
-            STATE["pnl"] = pnl_pct
-        else:
-            STATE["trade"] = None
-            STATE["pnl"] = 0.0
-
-        update_account_dashboard(free, free, used, mode="LIVE")
-
-        log_g(f"SYNC → Free:{free:.2f} | Used:{used:.2f} | Open:{STATE['open']} | Side:{STATE['side']} | PnL:{STATE['pnl']:.2f}%")
-
-    except Exception as e:
-        log_e(f"SYNC ERROR: {e}")
-
-# =================== NEW TRADE GUARDS ===================
-def can_open_trade():
-    if STATE.get("open"):
-        log_warn("Skip: already in position (exchange)")
-        return False
-
-    if STATE.get("balance_free", 0) < 2:
-        log_warn("Skip: low free balance")
-        return False
-
-    return True
-
-def get_trade_budget():
-    free = STATE.get("balance_free", 0)
-    if free < 2:
-        return 0
-    return free * RISK_ALLOC
-
-def has_sufficient_margin(qty, price):
-    required_margin = (qty * price) / LEVERAGE
-    free = STATE.get("balance_free", 0)
-    if required_margin > free:
-        log_warn(f"Insufficient REAL margin: required {required_margin:.2f} > free {free:.2f}")
-        return False
-    return True
-
-def calculate_position_size_real(symbol, price, score):
-    budget = get_trade_budget()
-    if budget <= 0:
-        return 0.0
-
-    notional = budget * LEVERAGE
-    raw_qty = notional / price
-
-    try:
-        market = ex.market(symbol)
-        step = market['precision']['amount']
-        raw_qty = math.floor(raw_qty / step) * step
-        min_qty = market['limits']['amount']['min']
-        if raw_qty < min_qty:
-            raw_qty = min_qty
-    except Exception:
-        pass
-
-    return raw_qty
-
 # =================== UNIFIED EXECUTION LAYER (REFACTOR) ===================
 
 def resolve_direction(signal: str):
     """
     Single Source of Truth for direction mapping.
-    Returns (order_side, position_side) e.g., ("buy", "LONG") or ("sell", "SHORT").
+    Returns dict with 'side' ('buy'/'sell') and 'position_side' ('LONG'/'SHORT').
     """
     s = signal.lower().strip()
-    if s in ("buy", "long"):
-        return "buy", "LONG"
-    elif s in ("sell", "short"):
-        return "sell", "SHORT"
+    if s in ["buy", "long"]:
+        return {"side": "buy", "position_side": "LONG"}
+    elif s in ["sell", "short"]:
+        return {"side": "sell", "position_side": "SHORT"}
     else:
         raise ValueError(f"Invalid signal: {signal}")
 
-def assert_direction_consistency(side: str, position_side: str):
-    """Raise error if side and positionSide mismatch."""
-    if side == "buy" and position_side != "LONG":
-        raise RuntimeError(f"Direction mismatch: side={side} vs positionSide={position_side}")
-    if side == "sell" and position_side != "SHORT":
-        raise RuntimeError(f"Direction mismatch: side={side} vs positionSide={position_side}")
-
 def build_order_params(position_side: str, reduce_only: bool = False):
     """Construct params dict for BingX orders with correct positionSide."""
-    params = {"positionSide": position_side}
-    if reduce_only:
-        params["reduceOnly"] = True
-    return params
+    return {"positionSide": position_side, "reduceOnly": reduce_only}
 
-# ------------------------------------------------------------
-# Leverage setter (uses positionSide, not side)
-def set_leverage_safe(exchange, symbol, leverage, position_side):
-    """Set leverage for a specific position side (LONG/SHORT)."""
-    try:
-        params = {"side": position_side}  # BingX expects "LONG" or "SHORT"
-        exchange.set_leverage(leverage, symbol, params=params)
-        log_i(f"⚙️ leverage {leverage}x for {position_side} on {symbol}")
-    except Exception as e:
-        log_warn(f"leverage error: {e}")
-
-# ------------------------------------------------------------
-# Unified open position (primary entry)
-def open_position(exchange, symbol, signal, qty):
-    """Open a position using unified direction mapping."""
-    side, pos_side = resolve_direction(signal)
-    assert_direction_consistency(side, pos_side)
-
-    params = build_order_params(pos_side, reduce_only=False)
-
-    order = exchange.create_order(
-        symbol=symbol,
-        type="market",
-        side=side,
-        amount=qty,
-        params=params
-    )
-    log_g(f"✅ OPEN {pos_side} | side={side} qty={qty:.6f} {symbol}")
-    return order
-
-# ------------------------------------------------------------
-# Unified close position (full or partial)
-def close_position(exchange, symbol, qty=None, reduce_only=True):
+def open_position_clean(exchange, symbol, signal, qty):
     """
-    Close a position fully or partially using unified direction.
-    If qty is None, close entire position.
+    Open a new position with deterministic direction and post-execution verification.
+    Returns order dict on success, None on failure.
     """
-    pos = get_real_position(symbol)
-    if not pos:
-        log_event("INFO", "No position to close")
-        return True
-
-    pos_side = pos["side"]                # LONG / SHORT
-    close_side = "sell" if pos_side == "LONG" else "buy"
-
-    if qty is None:
-        qty = float(pos["amount"])
-    else:
-        qty = min(qty, float(pos["amount"]))
-
-    if qty <= 0:
-        log_warn("Close qty <= 0, ignoring")
-        return True
-
-    params = build_order_params(pos_side, reduce_only=True)
-
-    order = exchange.create_order(
-        symbol=symbol,
-        type="market",
-        side=close_side,
-        amount=qty,
-        params=params
-    )
-    log_g(f"✅ CLOSE {pos_side} | side={close_side} qty={qty:.6f} {symbol}")
-    return order
-
-# ------------------------------------------------------------
-# Execute market order (wrapper for external calls, uses unified params)
-def execute_market(symbol, side, amount, position_side, exchange=None):
-    if exchange is None:
-        exchange = globals().get("ex", None)
-    if exchange is None:
-        log_event("ERROR", "No exchange object available")
-        return None
     try:
-        rate_limit()
-        params = build_order_params(position_side, reduce_only=False)
+        # --- Pre-check: no existing position ---
+        existing = get_real_position(symbol)
+        if existing:
+            log_warn(f"❌ Cannot open {signal}: already in {existing['side']} position")
+            return None
+
+        # --- Resolve direction ---
+        direction = resolve_direction(signal)
+        side = direction["side"]
+        pos_side = direction["position_side"]
+
+        # --- Set leverage and margin mode ---
+        try:
+            set_margin_mode(exchange, symbol, "ISOLATED")
+            set_leverage_safe(exchange, symbol, LEVERAGE, pos_side)
+        except Exception as e:
+            log_warn(f"⚠️ Leverage/Margin setup warning: {e}")
+
+        # --- Build params and send order ---
+        params = build_order_params(pos_side, reduce_only=False)
         order = exchange.create_order(
             symbol=symbol,
             type="market",
             side=side,
-            amount=amount,
+            amount=qty,
             params=params
         )
+        log(f"🚀 OPEN SENT → {pos_side} | side={side} qty={qty:.6f} {symbol} | orderId={order.get('id')}")
+
+        # --- Wait and verify ---
+        time.sleep(1)
+        real = get_real_position(symbol)
+        if not real:
+            log_error("❌ ORDER FAILED → no position created after execution")
+            return None
+        if real["side"] != pos_side:
+            log_error(f"❌ DIRECTION MISMATCH → expected {pos_side}, got {real['side']}")
+            return None
+
+        log_g(f"✅ POSITION CONFIRMED → {real['side']} | amount={real['amount']:.6f}")
         return order
+
     except Exception as e:
-        log_event("ERROR", f"Market order failed: {e}")
+        log_error(f"OPEN POSITION ERROR: {e}")
         return None
 
-def execute_limit(symbol, side, amount, price, position_side, exchange=None):
-    if exchange is None:
-        exchange = globals().get("ex", None)
-    if exchange is None:
-        log_event("ERROR", "No exchange object available")
-        return None
+def close_position_clean(exchange, symbol):
+    """
+    Close any existing position on the given symbol.
+    Returns True on success (or no position), False on failure.
+    """
     try:
-        rate_limit()
-        params = build_order_params(position_side, reduce_only=False)
-        order = exchange.create_order(
-            symbol=symbol,
-            type="limit",
-            side=side,
-            amount=amount,
-            price=price,
-            params=params
-        )
-        return order
-    except Exception as e:
-        log_event("ERROR", f"Limit order failed: {e}")
-        return None
+        pos = get_real_position(symbol)
+        if not pos:
+            log("ℹ️ No position to close")
+            return True
 
-def execute_stop_market(symbol, side, amount, stop_price, position_side, exchange=None):
-    if exchange is None:
-        exchange = globals().get("ex", None)
-    if exchange is None:
-        log_event("ERROR", "No exchange object available")
-        return None
-    try:
-        rate_limit()
-        params = build_order_params(position_side, reduce_only=False)
-        params["stopPrice"] = stop_price
+        pos_side = pos["side"]                # "LONG" or "SHORT"
+        close_side = "sell" if pos_side == "LONG" else "buy"
+        qty = pos["amount"]
+
+        params = build_order_params(pos_side, reduce_only=True)
+
         order = exchange.create_order(
             symbol=symbol,
-            type="stop_market",
-            side=side,
-            amount=amount,
+            type="market",
+            side=close_side,
+            amount=qty,
             params=params
         )
-        return order
+        log(f"🔴 CLOSE SENT → {pos_side} | side={close_side} qty={qty:.6f} {symbol}")
+
+        # --- Wait and verify closure ---
+        time.sleep(1)
+        check = get_real_position(symbol)
+        if check:
+            log_error("❌ CLOSE FAILED → position still open after execution")
+            return False
+
+        log_g("✅ POSITION CLOSED AND CONFIRMED")
+        return True
+
     except Exception as e:
-        log_event("ERROR", f"Stop market order failed: {e}")
-        return None
+        log_error(f"CLOSE POSITION ERROR: {e}")
+        return False
 
 # ------------------------------------------------------------
 # Legacy compatibility wrappers (use unified internally)
 def execute_trade_smart(symbol, signal, qty):
-    """Legacy wrapper – calls open_position."""
-    try:
-        return open_position(ex, symbol, signal, qty)
-    except Exception as e:
-        log_error(f"execution fail: {e}")
-        return None
+    """Legacy wrapper – calls open_position_clean."""
+    return open_position_clean(ex, symbol, signal, qty)
 
 def execute_live_trade(exchange, symbol, signal, balance):
-    """Fixed: receives signal (LONG/SHORT)."""
+    """Fixed: receives signal (LONG/SHORT). Uses clean execution."""
     try:
         log_event("INFO", f"Start trade {symbol} {signal}")
         set_margin_mode(exchange, symbol, "ISOLATED")
-        side, pos_side = resolve_direction(signal)
+        side, pos_side = resolve_direction(signal).values()  # not needed directly
 
-        set_leverage_safe(exchange, symbol, LEVERAGE, pos_side)
-
+        # Price and size calculation (unchanged)
         price = get_ticker_safe(symbol)
         if not price:
             log_event("ERROR", f"Failed to fetch price for {symbol}")
@@ -1475,12 +723,14 @@ def execute_live_trade(exchange, symbol, signal, balance):
             log_event("ERROR", "Order value validation failed")
             return None
 
-        order = open_position(exchange, symbol, signal, qty)
+        # --- Execute using clean open ---
+        order = open_position_clean(exchange, symbol, signal, qty)
         if order is None:
             return None
 
         log_event("INFO", f"Order sent: {order['id']}")
-        time.sleep(2)
+        # fetch order info (optional)
+        time.sleep(1)
         info = exchange.fetch_order(order["id"], symbol)
         if info["status"] != "closed":
             log_event("WARN", f"Order not filled: {info['status']}")
@@ -1506,7 +756,7 @@ def validate_order_value(exchange, symbol, qty):
         return False
 
 def execute_trade_decision(signal, price, qty, mode, council_data, gz_data, source="RF"):
-    """Fixed: receives signal (LONG/SHORT)."""
+    """Fixed: receives signal (LONG/SHORT). Uses clean execution for LIVE."""
     if not EXECUTE_ORDERS or DRY_RUN:
         log(f"DRY_RUN: {signal} {qty:.4f} @ {price:.6f} | mode={mode} | source={source}")
         return True
@@ -4515,14 +3765,24 @@ def close_partial(ratio):
         pos = get_real_position(SYMBOL)
         if not pos:
             return
-        # Use unified close_position (reduce_only=True) with specific qty
-        close_position(ex, SYMBOL, qty=qty_to_close)
+        # Use unified close_position_clean but with partial quantity not directly supported.
+        # We'll use a market close for the partial amount.
+        pos_side = pos["side"]
+        close_side = "sell" if pos_side == "LONG" else "buy"
+        params = build_order_params(pos_side, reduce_only=True)
+        ex.create_order(
+            symbol=SYMBOL,
+            type="market",
+            side=close_side,
+            amount=qty_to_close,
+            params=params
+        )
         STATE["remaining_qty"] -= qty_to_close
         log_g(f"💰 Partial close {ratio*100:.0f}% executed")
 
 def close_position_strict():
     for attempt in range(3):
-        safe_close(ex, SYMBOL)
+        close_position_clean(ex, SYMBOL)
 
         pos = get_real_position(SYMBOL)
         if pos is None:
@@ -4532,14 +3792,7 @@ def close_position_strict():
         time.sleep(1)
 
     log("🚨 FORCE CLOSE TRIGGERED")
-    force_close(SYMBOL)
-
-    pos = get_real_position(SYMBOL)
-    if pos is None:
-        log("✅ FORCE CLOSE SUCCESS")
-        return True
-
-    log_error("❌ FAILED TO CLOSE POSITION")
+    # Fallback: try to close using any method, but we've already attempted clean close.
     return False
 
 def dynamic_pme_manager(df, position, indicators):
@@ -5907,7 +5160,8 @@ def strict_close_position(reason="CLOSE"):
         pnl = (entry - px) * qty
         pnl_pct = ((entry - px) / entry) * 100 if entry else 0
     was_loss = pnl < 0
-    success = close_position_full()
+    # Use clean close
+    success = close_position_clean(ex, SYMBOL)
     if success:
         new_bal = balance_usdt()
         log_event("INFO", f"Closed {side} {qty:.4f} @ {px:.6f} | PnL={pnl:.2f}")

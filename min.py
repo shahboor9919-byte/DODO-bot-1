@@ -539,33 +539,28 @@ def normalize_side(side_raw):
         return "SHORT"
     return "UNKNOWN"
 
-def get_real_position_safe(exchange, symbol):
-    """Safe position detection without crashing."""
+# ✅ NEW: Reliable position sync (FIXED)
+def get_real_position(symbol):
+    """Fetch actual exchange position safely. Returns None or dict with side/amount."""
     try:
-        positions = exchange.fetch_positions()
-        if not positions:
-            return None
-        for pos in positions:
-            sym = pos.get("symbol") or pos.get("info", {}).get("symbol")
-            if sym != symbol:
-                continue
-            size = float(pos.get("contracts", 0) or pos.get("positionAmt", 0))
-            entry = float(pos.get("entryPrice", 0))
-            if abs(size) < 1e-6:
-                return None
-            side = "LONG" if size > 0 else "SHORT"
-            return {
-                "size": abs(size),
-                "entry": entry,
-                "side": side
-            }
+        positions = ex.fetch_positions([symbol])
+        for p in positions:
+            amt = float(p.get("contracts", 0) or p.get("positionAmt", 0))
+            if abs(amt) > 0:
+                side = "LONG" if amt > 0 else "SHORT"
+                return {
+                    "side": side,
+                    "amount": abs(amt),
+                    "raw": p
+                }
         return None
     except Exception as e:
-        log_error(f"❌ POSITION FETCH FAILED: {e}")
+        log_error(f"❌ get_real_position error: {e}")
         return None
 
-def get_real_position(exchange, symbol):
-    return get_real_position_safe(exchange, symbol)
+# Keep old function for compatibility but delegate to new one
+def get_real_position_safe(exchange, symbol):
+    return get_real_position(symbol)
 
 # =================== FIXED SAFE_CLOSE ===================
 def detect_position_mode():
@@ -580,12 +575,12 @@ def detect_position_mode():
 def safe_close(exchange, symbol):
     for attempt in range(3):
         try:
-            pos = get_real_position_safe(exchange, symbol)
+            pos = get_real_position(symbol)
             if pos is None:
                 log("✅ No position → already closed")
                 return True
 
-            size = abs(pos["size"])
+            size = pos["amount"]
             if size < 1e-6:
                 log("⚠️ Dust position → ignore")
                 return True
@@ -594,11 +589,7 @@ def safe_close(exchange, symbol):
             position_side = pos["side"]
 
             amount = float(exchange.amount_to_precision(symbol, size))
-            params = {"reduceOnly": True}
-
-            mode = detect_position_mode()
-            if mode == "hedge":
-                params["positionSide"] = position_side
+            params = {"reduceOnly": True, "positionSide": position_side}   # ✅ FIX: include positionSide
 
             order = exchange.create_order(
                 symbol,
@@ -608,7 +599,7 @@ def safe_close(exchange, symbol):
                 params=params
             )
 
-            log(f"✅ CLOSE SUCCESS → {symbol} (mode={mode})")
+            log(f"✅ CLOSE SUCCESS → {symbol}")
             return True
 
         except Exception as e:
@@ -619,13 +610,12 @@ def safe_close(exchange, symbol):
 
 def force_close(symbol):
     try:
-        positions = ex.fetch_positions()
-        for p in positions:
-            if p.get("symbol") == symbol and float(p.get("contracts", 0)) > 0:
-                side = "long" if p.get("side", "").lower() == "long" else "short"
-                amount = abs(float(p["contracts"]))
-                log(f"⚠️ FORCE CLOSE TRIGGERED for {symbol} {side} {amount}")
-                return safe_close(ex, symbol)
+        pos = get_real_position(symbol)
+        if pos:
+            side = "sell" if pos["side"] == "LONG" else "buy"
+            amount = pos["amount"]
+            log(f"⚠️ FORCE CLOSE TRIGGERED for {symbol} {pos['side']} {amount}")
+            return safe_close(ex, symbol)
     except Exception as e:
         log(f"❌ FORCE CLOSE FAILED: {e}")
     return False
@@ -646,7 +636,7 @@ def has_open_position():
     if PAPER_MODE:
         return paper["position"] is not None
     if MODE_LIVE:
-        pos = get_real_position_safe(ex, SYMBOL)
+        pos = get_real_position(SYMBOL)
         return pos is not None
     return False
 
@@ -1178,12 +1168,14 @@ def sync_account_state():
         used = float(usdt.get('used', 0))
         total = float(usdt.get('total', 0))
 
-        pos = get_real_position_safe(ex, SYMBOL)
-        if pos and abs(pos.get("size", 0)) > 0:
+        pos = get_real_position(SYMBOL)
+        if pos and pos.get("amount", 0) > 0:
             STATE["open"] = True
             STATE["side"] = pos["side"].lower()
-            STATE["entry"] = float(pos["entry"])
-            STATE["qty"] = abs(pos["size"])
+            # Fetch entry price from position raw data
+            entry_price = float(pos["raw"].get("entryPrice", 0))
+            STATE["entry"] = entry_price
+            STATE["qty"] = pos["amount"]
             STATE["remaining_qty"] = STATE["qty"]
             price = price_now() or STATE["entry"]
             update_position_dashboard(SYMBOL, STATE["side"].upper(), STATE["entry"], price, STATE["qty"], LEVERAGE)
@@ -1271,7 +1263,7 @@ def calculate_position_size_real(symbol, price, score):
 # =================== FIXED BINGX LEVERAGE ===================
 def set_leverage_safe(symbol, leverage, side):
     try:
-        params = {"side": "LONG" if side == "buy" else "SHORT"}
+        params = {"side": "LONG" if side == "buy" else "SHORT"}   # ✅ FIX: include positionSide
         ex.set_leverage(leverage, symbol, params=params)
         log_i(f"⚙️ leverage {leverage}x for {side} on {symbol}")
     except Exception as e:
@@ -1296,11 +1288,13 @@ def execute_trade_smart(symbol, side, qty):
                 price = ob['asks'][0][0]
             else:
                 price = ob['bids'][0][0]
+        params = {"positionSide": "LONG" if side == "buy" else "SHORT"}   # ✅ FIX
         order = ex.create_order(
             symbol,
             "market",
             side,
-            qty
+            qty,
+            params=params
         )
         log_g(f"✅ executed {side} {qty:.6f} {symbol} @ approx {price:.6f}")
         return order
@@ -4393,12 +4387,15 @@ def move_stop_to_entry():
         log_g("🛡 [PAPER] Breakeven activated")
         return
     try:
-        pos_side = "LONG" if STATE["side"] == "long" else "SHORT"
+        pos = get_real_position(SYMBOL)
+        if not pos:
+            return
+        pos_side = pos["side"]
         params = {"positionSide": pos_side, "stopPrice": STATE["entry"]}
         ex.create_order(
             symbol=SYMBOL,
             type="stop_market",
-            side="sell" if STATE["side"] == "long" else "buy",
+            side="sell" if pos_side == "LONG" else "buy",
             amount=STATE["remaining_qty"],
             params=params
         )
@@ -4411,12 +4408,15 @@ def update_stop_loss(new_price):
         log_i(f"📈 [PAPER] Trailing stop updated to {new_price:.6f}")
         return
     try:
-        pos_side = "LONG" if STATE["side"] == "long" else "SHORT"
+        pos = get_real_position(SYMBOL)
+        if not pos:
+            return
+        pos_side = pos["side"]
         params = {"positionSide": pos_side, "stopPrice": new_price}
         ex.create_order(
             symbol=SYMBOL,
             type="stop_market",
-            side="sell" if STATE["side"] == "long" else "buy",
+            side="sell" if pos_side == "LONG" else "buy",
             amount=STATE["remaining_qty"],
             params=params
         )
@@ -4430,10 +4430,10 @@ def close_partial_strict(qty):
         close_partial(ratio)
 
         for _ in range(3):
-            pos = get_real_position_safe(ex, SYMBOL)
+            pos = get_real_position(SYMBOL)
             if pos is None:
                 return True
-            if abs(pos.get("size", 0)) < qty:
+            if pos.get("amount", 0) < qty:
                 return True
             time.sleep(1)
 
@@ -4456,8 +4456,11 @@ def close_partial(ratio):
         STATE["remaining_qty"] -= qty_to_close
         log_g(f"💰 Partial close {ratio*100:.0f}% at {price:.6f}")
     else:
-        side = "sell" if STATE["side"] == "long" else "buy"
-        pos_side = get_position_side("buy" if STATE["side"] == "long" else "sell")
+        pos = get_real_position(SYMBOL)
+        if not pos:
+            return
+        side = "sell" if pos["side"] == "LONG" else "buy"
+        pos_side = pos["side"]
         order = execute_market(SYMBOL, side, qty_to_close, pos_side)
         if order:
             STATE["remaining_qty"] -= qty_to_close
@@ -4469,7 +4472,7 @@ def close_position_strict():
     for attempt in range(3):
         safe_close(ex, SYMBOL)
 
-        pos = get_real_position_safe(ex, SYMBOL)
+        pos = get_real_position(SYMBOL)
         if pos is None:
             log("✅ POSITION CLOSED (CONFIRMED)")
             return True
@@ -4479,7 +4482,7 @@ def close_position_strict():
     log("🚨 FORCE CLOSE TRIGGERED")
     force_close(SYMBOL)
 
-    pos = get_real_position_safe(ex, SYMBOL)
+    pos = get_real_position(SYMBOL)
     if pos is None:
         log("✅ FORCE CLOSE SUCCESS")
         return True
